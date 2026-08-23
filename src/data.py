@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import numpy as np
 import requests
 import pandas as pd
 
@@ -37,7 +38,8 @@ def load_data() -> pd.DataFrame:
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["TotalCharges"] = pd.to_numeric(out["TotalCharges"], errors="coerce")
-    out["avg_monthly_value"] = out["TotalCharges"] / out["tenure"].replace(0, pd.NA)
+    tenure_denominator = out["tenure"].astype(float).where(out["tenure"] > 0, np.nan)
+    out["avg_monthly_value"] = out["TotalCharges"] / tenure_denominator
     service_cols = [
         "PhoneService","OnlineSecurity","OnlineBackup","DeviceProtection",
         "TechSupport","StreamingTV","StreamingMovies"
