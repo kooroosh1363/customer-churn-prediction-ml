@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 import json
 import joblib
@@ -83,11 +82,40 @@ def subgroup_metrics(X: pd.DataFrame, y: pd.Series, prob: np.ndarray, threshold:
     return pd.DataFrame(rows)
 
 
+def export_selected_model_shap(selected: Pipeline, X_train: pd.DataFrame, X_test: pd.DataFrame) -> str:
+    """Export global SHAP importance for the model that was actually selected."""
+    prep = selected.named_steps["prep"]
+    model = selected.named_steps["model"]
+    feature_names = prep.get_feature_names_out()
+    train_transformed = prep.transform(X_train.iloc[:500])
+    test_transformed = prep.transform(X_test.iloc[:250])
+
+    if isinstance(model, LogisticRegression):
+        explainer = shap.LinearExplainer(model, train_transformed)
+        values = explainer.shap_values(test_transformed)
+        method = "LinearExplainer"
+    elif isinstance(model, RandomForestClassifier):
+        explainer = shap.TreeExplainer(model)
+        sv = explainer.shap_values(test_transformed)
+        values = sv[1] if isinstance(sv, list) else (sv[:, :, 1] if getattr(sv, "ndim", 0) == 3 else sv)
+        method = "TreeExplainer"
+    else:
+        raise TypeError(f"Unsupported selected model type: {type(model).__name__}")
+
+    importance = np.abs(np.asarray(values)).mean(axis=0)
+    pd.DataFrame({"feature": feature_names, "mean_abs_shap": importance}).sort_values(
+        "mean_abs_shap", ascending=False
+    ).to_csv(ART / "shap_feature_importance.csv", index=False)
+    return method
+
+
 def main() -> None:
     ART.mkdir(exist_ok=True)
     df = engineer_features(load_data())
     ids = df.pop("customerID")
     y = (df.pop("Churn") == "Yes").astype(int)
+
+    # All learned preprocessing is fitted only inside the training pipeline.
     X_train, X_temp, y_train, y_temp, id_train, id_temp = train_test_split(
         df, y, ids, test_size=0.40, stratify=y, random_state=RANDOM_STATE
     )
@@ -114,42 +142,40 @@ def main() -> None:
         validation[name] = evaluate(y_val, prob, 0.5)
         fitted[name] = pipe
 
+    # PR-AUC is the model-selection metric because churn is the minority class.
     selected_name = max(validation, key=lambda n: validation[n]["pr_auc"])
     selected = fitted[selected_name]
+
+    # The operating threshold is chosen only on validation data.
     val_prob = selected.predict_proba(X_val)[:, 1]
     threshold, threshold_table = choose_threshold(y_val, val_prob)
+
+    # The test set remains untouched until model and threshold decisions are complete.
     test_prob = selected.predict_proba(X_test)[:, 1]
-    test_metrics = evaluate(y_test, test_prob, threshold)
+    test_metrics_default = evaluate(y_test, test_prob, 0.5)
+    test_metrics_optimized = evaluate(y_test, test_prob, threshold)
+    shap_method = export_selected_model_shap(selected, X_train, X_test)
 
     report = {
         "split_sizes": {"train": len(X_train), "validation": len(X_val), "test": len(X_test)},
         "target_rates": {"train": y_train.mean(), "validation": y_val.mean(), "test": y_test.mean()},
         "validation_at_0_5": validation,
-        "selected_model": selected_name,
+        "selection_policy": {"metric": "validation_pr_auc", "selected_model": selected_name},
         "threshold_policy": {
             "selected_on": "validation only",
             "false_negative_cost": FALSE_NEGATIVE_COST,
             "false_positive_cost": FALSE_POSITIVE_COST,
             "chosen_threshold": threshold,
+            "costs_are": "illustrative scenario assumptions",
         },
-        "test_metrics": test_metrics,
+        "test_metrics_at_0_5": test_metrics_default,
+        "test_metrics": test_metrics_optimized,
+        "explainability": {"model": selected_name, "method": shap_method},
     }
     (ART / "metrics.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     threshold_table.to_csv(ART / "threshold_search.csv", index=False)
     subgroup_metrics(X_test, y_test, test_prob, threshold).to_csv(ART / "subgroup_metrics.csv", index=False)
     joblib.dump(selected, ART / "model.joblib")
-
-    # Explain the fitted random-forest challenger when available, independent of selection.
-    rf = fitted["random_forest"]
-    transformed = rf.named_steps["prep"].transform(X_test.iloc[:250])
-    feature_names = rf.named_steps["prep"].get_feature_names_out()
-    explainer = shap.TreeExplainer(rf.named_steps["model"])
-    sv = explainer.shap_values(transformed)
-    values = sv[1] if isinstance(sv, list) else (sv[:, :, 1] if getattr(sv, "ndim", 0) == 3 else sv)
-    importance = np.abs(values).mean(axis=0)
-    pd.DataFrame({"feature": feature_names, "mean_abs_shap": importance}).sort_values(
-        "mean_abs_shap", ascending=False
-    ).to_csv(ART / "shap_feature_importance.csv", index=False)
 
     print(json.dumps(report, indent=2))
 
